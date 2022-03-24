@@ -1,0 +1,526 @@
+---
+title: "CSP571. Project"
+author: "Caridad Arroyo Arevalo, Kemen Goicoechea and Luis Mares De La Cruz"
+output:
+   html_notebook:
+      toc: yes
+      toc_float: yes
+   html_document:
+      toc: yes
+      df_print: paged
+---
+###
+```{r}
+library(dplyr, verbose=F)
+library(rpart, verbose=F)
+library(rpart.plot, verbose=F)
+library(psych, verbose=F)
+library(ggplot2, verbose=F)
+library(reshape2, verbose=F)
+library(caret, verbose=F)
+library(pROC, verbose=F)
+library(corrplot, verbose=F)
+library(randomForest, verbose=F)
+library(e1071, verbose=F)
+library(keras, verbose=F)
+library(cluster, verbose=F)
+library(factoextra, verbose=F)
+library(NbClust, verbose=F)
+library(ROSE, verbose=F)
+library(rfUtilities, verbose=F)
+library(latex2exp, verbose=F)
+library(ROCR, verbose=F)
+library(klaR, verbose=F)
+library(patchwork, verbose=F)
+rm(list=ls())
+#setwd("/Users/luismares/Documents/workspace/RStudio/CSP571/Project") #Luis's wd
+#setwd("~/Desktop/Universidad/Workspace/R/CSP571/Project") #Cari's wd
+```
+
+## 1 DATA PREPROCESSING STAGE
+### 1.1 DATA CLEANING
+```{r}
+df<-read.csv("US_Accidents_Dec20_updated.csv", sep=",", header=T)
+
+# 1.1.1 HANDLE MISSING VALUES
+#Check for missing values
+missing <- data.frame(sapply(df, function(x) sum(is.na(x))))
+colnames(missing) <- c("missing_values")
+missing <- subset(missing, missing_values != 0)
+missing$percentage <- round(missing$missing_values/nrow(df)*100,3)
+missing
+# Nearly 70% of observations lack 'Number'. This is a high amount of observations to which no accurate replacement method could be applied. Therefore, the column is removed.
+df$Number <- NULL
+# 'Temperature.F.', 'Wind_Chill.F.', 'Humidity...', 'Pressure.in.', 'Visibility.mi.', 'Wind_Speed.mph.', 'Precipitation.in.' present missing values. All but number are related to weather conditions. Since weather conditions are similar in close areas on close dates, we'll fill these features' missing values using linear interpolation.
+df$Temperature.F.[is.na(df$Temperature.F.)]<-na.approx(df$Temperature.F.,rule=2)
+df$Wind_Chill.F.[is.na(df$Wind_Chill.F.)]<-na.approx(df$Wind_Chill.F.,rule=2)
+df$Humidity...[is.na(df$Humidity...)]<-na.approx(df$Humidity...,rule=2)
+df$Pressure.in.[is.na(df$Pressure.in.)]<-na.approx(df$Pressure.in.,rule=2)
+df$Visibility.mi.[is.na(df$Visibility.mi.)]<-na.approx(df$Visibility.mi.,rule=2)
+df$Wind_Speed.mph.[is.na(df$Wind_Speed.mph.)]<-na.approx(df$Wind_Speed.mph.,rule=2)
+df$Precipitation.in.[is.na(df$Precipitation.in.)]<-na.approx(df$Precipitation.in.,rule=2)
+
+# Check for empty characters
+empty.char <- data.frame(sapply(df, function(x) sum(x=="")))
+colnames(empty.char) <- c("empty_values")
+empty.char <- subset(empty.char, empty_values != 0)
+empty.char$percentage <- round(empty.char$empty_values/nrow(df)*100,3)
+empty.char
+# Some features have a percentage of empty observations under 0.3%. Such observ are dropped
+df <- subset(df, Airport_Code!="")
+df <- subset(df, City!="")
+# However, those with >0.3% have their empty chars replaced by a new category: "unknown"
+df$Weather_Timestamp <- replace(df$Weather_Timestamp, df$Weather_Timestamp=="", "Unknown")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="", "Unknown")
+df$Weather_Condition <- replace(df$Weather_Condition, df$Weather_Condition=="", "Unknown")
+
+# 1.1.2. DEAL WITH NOISY DATA & ANOMALIES
+# We look for outliers in numeric features. We first print a summary of our data set.
+numeric.cols <- select_if(df, is.numeric)[,-1]
+summary(numeric.cols)
+# Boxplots and histograms are useful tools to display outliers.
+for (i in 1:ncol(numeric.cols)){
+   print(ggplot(stack(numeric.cols[i]), aes(x=ind, y=values, fill=ind)) + geom_boxplot())
+   hist(numeric.cols[,i], xlab=colnames(numeric.cols)[i])
+}
+# We'll now treat features with outliers independently
+# Distance.mi.: remove observations whose value exceeds Q3+1.5IQR
+df<-filter(df, Distance.mi. <= (summary(numeric.cols$Distance.mi.)[["3rd Qu."]]+1.5*(summary(numeric.cols$Distance.mi.)[["3rd Qu."]]-summary(numeric.cols$Distance.mi.)[["1st Qu."]])))
+# Temperature.F.: keep observations whose value lies within Q1-1.5IQR and Q3+1.5IQR
+df<-filter(df, (Temperature.F. <= (summary(numeric.cols$Temperature.F.)[["3rd Qu."]]+1.5*(summary(numeric.cols$Temperature.F.)[["3rd Qu."]]-summary(numeric.cols$Temperature.F.)[["1st Qu."]])) & (Temperature.F. >= (summary(numeric.cols$Temperature.F.)[["1st Qu."]]-1.5*(summary(numeric.cols$Temperature.F.)[["3rd Qu."]]-summary(numeric.cols$Temperature.F.)[["1st Qu."]])))))
+# Wind_Chill.F.: remove observations whose value is less than Q1-1.5IQR
+df<-filter(df, Wind_Chill.F. >= (summary(numeric.cols$Wind_Chill.F.)[["1st Qu."]]-1.5*(summary(numeric.cols$Wind_Chill.F.)[["3rd Qu."]]-summary(numeric.cols$Wind_Chill.F.)[["1st Qu."]])))
+# Pressure.in.: keep observations whose value lies within 28-31 in. -> standard pressure range
+df<-filter(df, (Pressure.in. >= 28 & Pressure.in. <= 31))
+# Visibility.mi.: remove observations whose value exceeds 10 mi. -> standard visibility range
+df<-filter(df, Visibility.mi. <= 10)
+# Wind_Speed.mph.: remove observations whose value exceed Q3+1.5IQR
+df<-filter(df, Wind_Speed.mph. <= (summary(numeric.cols$Wind_Speed.mph.)[["3rd Qu."]]+1.5*(summary(numeric.cols$Wind_Speed.mph.)[["3rd Qu."]]-summary(numeric.cols$Wind_Speed.mph.)[["1st Qu."]])))
+# Precipitation.in.: remove observations whose value exceeds 2 in. -> standard precip. range
+df<-filter(df, Precipitation.in. <= 2)
+
+# Store the new df
+write.csv(df,"df.11.csv", row.names=F)
+```
+
+### 1.2 DATA REDUCTION
+```{r}
+df<-read.csv("df.11.csv", sep=",")
+
+# 1.2.1 Drop unnecessary features
+# The scope of the project is to analyze the impact of weather conditions on traffic accidents in order to create a real-time accident prediction tool.
+# Therefore, only features related to weather, geographical location and time will be kept. 
+df <- subset(df, select=c(2:8,13:29,43:46))
+
+write.csv(df,"df.12.csv", row.names=F)
+```
+
+### 1.3 DATA TRANSFORMATION
+```{r}
+df<-read.csv("df.12.csv", sep=",")
+
+# 1.3.1 SELECT MOST APPROPIATE DATA CLASSES
+# First, we create different columns for year, month, day, time.
+df$Year <- as.numeric(substr(df$Start_Time, 1, 4))
+df$Month <- as.numeric(substr(df$Start_Time, 6, 7))
+df$Day <- as.numeric(substr(df$Start_Time, 9, 10))
+df$Time <- as.numeric(substr(df$Start_Time, 12, 13))
+# Zip+4 codes identify a geographic segment within a standard zipcode and are often subject to change. This gives no additional info. We'll stick with the first 5 digits the std zipcode
+df$Zipcode <- as.numeric(substr(df$Zipcode, 1, 5))
+# Wind_Direction has duplicated values (same value in different formats, e.g. "W" and "West"). Let's fix these results
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="Calm", "CALM")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="Variable", "VAR")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="West", "W")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="WNW", "NW")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="NNW", "NW")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="North", "N")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="NNE", "NE")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="ENE", "NE")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="East", "E")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="SSE", "SE")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="ESE", "SE")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="South", "S")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="SSW", "SW")
+df$Wind_Direction <- replace(df$Wind_Direction, df$Wind_Direction=="WSW", "SW")
+
+# 1.3.2 AGGREGATION
+# We combine the start and end time of the accident to create the duration of the accident
+interval <- interval(strptime(df$Start_Time,"%Y-%m-%d %H:%M:%S"), strptime(df$End_Time,"%Y-%m-%d %H:%M:%S"))
+df$Duration <- round(time_length(interval, unit="minute"),2)
+# The exact location of the accident will result from the avg of the end and start lats/longs
+df$Lat <- rowMeans(df[,c("Start_Lat","End_Lat")])
+df$Lng <- rowMeans(df[,c("Start_Lng","End_Lng")])
+# Drop useless columns
+df$Start_Time <- NULL
+df$End_Time <- NULL
+df$Start_Lat <- NULL
+df$End_Lat <- NULL
+df$Start_Lng <- NULL
+df$End_Lng <- NULL
+df$Weather_Timestamp <- NULL # This info is covered by the previously created "date-time" cols
+df$Country <- NULL # All obs are from US (1 country)
+# Reorder columns
+df <- df[,c(1,21:27,2:20)]
+
+# 1.3.3 DISCRETIZATION & NORMALIZATION
+# Convert all char columns to factor columns
+df <- as.data.frame(unclass(df), stringsAsFactors = TRUE)
+
+write.csv(df,"df.13.csv", row.names=F)
+```
+
+## 2 DATA EXPLORATION STAGE
+### 2.1 STATISTICS
+```{r}
+df <- read.csv("df.13.csv", sep=",", stringsAsFactors=T)
+
+#2.1.2 Average accidents per day
+df$Date <- make_date(df$Year, df$Month, df$Day)
+uniq_date <- unique(df$Date)
+average <- length(df$Date)/length(uniq_date)
+
+print(sprintf("The average of accidents per day is %.2f", average))
+
+#2.1.3 5-number summaries
+for(i in 0:length(names(df)))
+{   
+    print(names(df)[i])
+    print(summary(df[,i]))
+    print("----------")
+}
+
+#Number of each class
+print(sprintf("Number of Severity-1 accidents: %d",sum(with(df,Severity == 1))))
+print(sprintf("Number of Severity-2 accidents: %d",sum(with(df,Severity == 2))))
+print(sprintf("Number of Severity-3 accidents: %d",sum(with(df,Severity == 3))))
+print(sprintf("Number of Severity-4 accidents: %d",sum(with(df,Severity == 4))))
+
+write.csv(df,"df.21.csv", row.names=F)
+```
+
+### 2.2 VISUALIZATIONS
+```{r}
+df <- read.csv("df.21.csv", sep=",", stringsAsFactors=T)
+
+
+for(i in 1:length(df_test[,1])){
+   df[i,1] <- toString(df[i,1])   
+}
+
+#2.2.2
+p1 <- ggplot(df, aes(x=Time, fill=Severity)) + geom_histogram(bins=24) + xlab("Time of day") + ylab("Number of accidents")
+
+#2.2.3
+p2 <- ggplot(df, aes(x=Temperature.F., fill=Severity)) + geom_histogram(bins = 15) + ylab("Number of accidents")
+p3 <- ggplot(df, aes(x=Humidity..., fill=Severity)) + geom_histogram(bins = 15) + ylab("Number of accidents")
+
+#2.2.5
+p4 <- ggplot(df, aes(x=Month, fill=Severity)) + geom_histogram(bins=12) + xlim(1,12) + ylab("Number of accidents")
+
+#2.2.4 Pie plots
+#Cities 
+city_occ <- table(df$City) %>%
+    as.data.frame() %>% 
+    arrange(desc(Freq))
+
+num_cities <- 8
+
+main_cities <- city_occ[(1:num_cities),] 
+main_cities$Var1 <- sapply(main_cities[,'Var1'], as.character)
+
+main_cities[nrow(main_cities) + 1,] <- c( "Others", sum(city_occ[-(1:num_cities),]$Freq))
+main_cities$percent <- as.numeric(main_cities$Freq) / sum(as.numeric(main_cities$Freq)) * 100
+
+#main_cities <- main_cities[order(main_cities$Var1),]
+
+pie_cities <- ggplot(main_cities, aes(x="", y=percent, fill=as.factor( rownames(main_cities) ))) +
+   geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0) +
+   scale_fill_brewer( palette="Blues", direction=-1,
+                     name = "City and Percentage", 
+                     labels = sprintf("%s (%.3f)",main_cities$Var1, main_cities$percent) ) +
+   xlab("") + 
+   ylab("") + theme(axis.title.x=element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.title.y=element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), panel.background = element_rect(fill = "white"))
+
+#States
+state_occ <- table(df$State) %>%
+    as.data.frame() %>% 
+    arrange(desc(Freq))
+
+num_states <- 8
+
+main_states <- state_occ[(1:num_states),] 
+main_states$Var1 <- sapply(main_states[,'Var1'], as.character)
+
+main_states[nrow(main_states) + 1,] <- c( "Others", sum(state_occ[-(1:num_states),]$Freq))
+main_states$percent <- as.numeric(main_states$Freq) / sum(as.numeric(main_states$Freq)) * 100
+
+#main_cities <- main_cities[order(main_cities$Var1),]
+
+pie_state <- ggplot(main_states, aes(x="", y=percent, fill=as.factor( rownames(main_states) ))) +
+   geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0) +
+   scale_fill_brewer( palette="Blues", direction=-1,
+                     name = "State and Percentage", 
+                     labels = sprintf("%s (%.3f)",main_states$Var1, main_states$percent) ) +
+   xlab("") + 
+   ylab("") + theme(axis.title.x=element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.title.y=element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), panel.background = element_rect(fill = "white"))
+
+
+#Timezones
+timezone_occ <- table(df$Timezone) %>%
+    as.data.frame() %>% 
+    arrange(desc(Freq))
+
+num_timezones <- 4
+
+timezones <- timezone_occ[(1:num_timezones),] 
+timezones$Var1 <- sapply(timezones[,'Var1'], as.character)
+
+timezones$percent <- as.numeric(timezones$Freq) / sum(as.numeric(timezones$Freq)) * 100
+
+
+pie_timezone <- ggplot(timezones, aes(x="", y=percent, fill=as.factor(rownames(timezones)))) +
+   geom_bar(width = 1, stat = "identity") + coord_polar("y", start=0) +
+   scale_fill_brewer( palette="Blues", direction=-1,
+                     name = "Timezone and Percentage", 
+                     labels = sprintf("%s (%.3f)",timezones$Var1, timezones$percent) ) +
+   xlab("") + 
+   ylab("") + theme(axis.title.x=element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.title.y=element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), panel.background = element_rect(fill = "white"))
+
+
+#Map of the US
+df.map = df[(df$Severity==1 | df$Severity==2 | df$Severity==3),]
+df.map$Severity = "1 to 3"
+df.map <- rbind(df.map, df[(df$Severity==4),])
+
+map_severity <- ggplot(df.map, aes(x=Lng, y=Lat, color=as.factor(Severity))) + geom_point(size=0.01, alpha=0.4) + scale_color_manual(name="Severity",values = c("#3399FF","#210F92") ) + labs(title = "Localization and Severity of accidents\n",color = "Severity\n") + guides(colour = guide_legend(override.aes = list(alpha = 1, size =3))) +  theme(axis.title.x=element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank(), axis.title.y=element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), panel.background = element_rect(fill = "white"))
+
+
+#Display
+pie_cities
+pie_state
+pie_timezone
+map_severity
+
+
+p1
+p2
+p3
+p4
+
+write.csv(df,"df.22.csv", row.names=F)
+```
+
+## 3 DATA MINING STAGE
+### 3.1 FEATURE SELECTION
+```{r}
+# Due to computational issues, we need to reduce the number of observations in order to perform the analysis. According to the results in the Visualizations stage (2.2), most of the accidents occur in the Pacific and Eastern timezones. Which area???
+
+# Pacific Timezone
+df <- read.csv("df.22.csv", sep=",", stringsAsFactors=T) # df before
+df <- subset(df,select=c(1,13,15:27))
+#df <- subset(df, Timezone=="US/Pacific")
+#df$Timezone <- NULL
+
+# 3.1.1 TEST/TRAIN SPLIT
+set.seed(571)
+index <- sample(1:nrow(df), 0.8*dim(df)[1])
+df.train <- df[index,]
+df.test <- df[-index,]
+
+# 3.1.2 MULTICOLLINEARITY EVALUATION
+# To evaluate multicollinearity, we need to transform all 'factor' predictors to 'int'
+must.convert <- sapply(df.train,is.factor)
+df.train.aux <- sapply(df.train[,must.convert],unclass)
+df.train <- cbind(df.train[,!must.convert],df.train.aux)
+
+corr.pred <- cor(df.train[,-1])
+corrplot(corr.pred, method="number", number.cex=0.5, tl.cex=0.5)
+# The correlation matrix shows high correlation between many predictors. Multicollinearity increases the variance of the estimated coefficients and makes them very sensitive to minor changes in the model. As a result, the classifier performance can be very unstable. Therefore, we proceed to remove all variables involved in multicollinearity (but 1!). The threshold is set at +-0.75.
+df.train$Civil_Twilight <- NULL # multicoll with other twilights + sunrise_sunset
+df.train$Nautical_Twilight <- NULL # multicoll with other twilights + sunrise_sunset
+df.train$Astronomical_Twilight <- NULL # multicoll with other twilights + sunrise_sunset
+
+# 3.1.3 PREDICTORS' SIGNIFICANCE EVALUATION
+# To assess which are the most statistically significant predictors, we can perform a linear regression.
+lm.fit <- lm(Severity ~ ., data=df.train)
+summary(lm.fit)
+# All are statistically significant. No additional predictors are removed.
+
+# We go back and use the original dfP.train (without all factor predictors being int) to remove such unwanted variables
+df.train$Civil_Twilight <- NULL
+df.train$Nautical_Twilight <- NULL
+df.train$Astronomical_Twilight <- NULL
+
+# 3.1.4 PREDICTORS' BEHAVIOUR EVALUATION
+#  (If time!!!)
+# We can use clustering (K-Means) to improve our classification. Two ways: (i) substitute your data set with the cluster centers, and use this for classification (ii) train a separate classifier on each cluster, and build an ensemble out of them.
+# Optimal number of clusters
+# fviz_nbclust(df.train, kmeans, method="silhouette", k.max=1000) + labs(subtitle="Silhouette method")
+
+# 3.1.5 LINEARITY EVALUATION
+plot(lm.fit, which=1)
+# ?? Results
+write.csv(df,"df.31.csv", row.names=F)
+write.csv(df.aux, "df.train.31.csv", row.names=F)
+write.csv(df.test, "df.test.31.csv", row.names=F)
+```
+
+
+### 3.2 CLASSIFICATION
+```{r}
+df <- read.csv("df.31.csv", sep=",", stringsAsFactors=T)
+
+# Converting values to integers to be able to fit the model
+list <- lapply(df, function(x) {if(is.factor(x)) unclass(x) else x})
+df <- as.data.frame(list)
+
+df$Severity <- factor(df$Severity)
+
+df.aux <- sample(1:nrow(df), 20000, replace = FALSE)
+df.aux <- df[df.aux, ]
+
+set.seed(571)
+index <- sample(1:nrow(df.aux), 0.8*dim(df.aux)[1])
+df.train.aux <- df.aux[index,]
+df.test.aux <- df.aux[-index,]
+
+df.train.aux$Civil_Twilight <- NULL
+df.train.aux$Nautical_Twilight <- NULL
+df.train.aux$Astronomical_Twilight <- NULL
+
+# The data set is extremely imbalanced
+prop.table(table(df.train.aux$Severity))
+
+# The function ovun.sample is used to balance the dataset. Since this function can only be used for response values with two levels, the dataset is splitted into two subsets. These will be combined afterwards.
+df.aux1 <- rbind(subset(df.train.aux,Severity == 1), subset(df.train.aux,Severity == 2))
+df.aux2 <- rbind(subset(df.train.aux,Severity == 3), subset(df.train.aux,Severity == 4))
+
+df.aux1 <- ovun.sample(Severity~., data = df.aux1, method = "both")$data
+df.aux2 <- ovun.sample(Severity~., data = df.aux2, method = "both", N=nrow(df.aux1))$data
+
+df.train.aux <- rbind(df.aux1,df.aux2)
+
+# Now the data set is balanced
+prop.table(table(df.train.aux$Severity))
+
+# 3.2.1 BUILD MODEL
+
+# DECISION TREES (Prunning and RF)
+# Two approaches will be analyzed. The first involves building a decision tree and prunning it afterwards, while in the second we will perform Random Forest.
+
+# We build the decision tree
+model <- rpart(Severity ~ ., method = "class", data=df.train.aux)
+rpart.plot(model, extra=104, fallen.leaves=T, type=4, main="Decision tree", box.palette = "YlGnBl")
+
+pred.tree <- predict(model, df.test.aux, type = "class")
+confmatrix.tree <- confusionMatrix(pred.tree, df.test.aux$Severity)
+confmatrix.tree$overall["Accuracy"] # The decision tree is able to predict with a 30.77% of accuracy, which is a low value.
+
+# 1ST APPROACH - Prunning 
+plotcp(model)
+cpx <- model$cptable[which.min(model$cptable[,"xerror"]), "CP"] # We set as complexity parameter the optimal one
+model.pruned <- prune(model,cp=cpx)
+rpart.plot(model.pruned, extra=104, fallen.leaves=T, type=4, main="Pruned decision tree", box.palette = "YlGnBl")
+
+pred.tree.pruned <- predict(model.pruned, df.test.aux, type = "class")
+confmatrix.tree.pruned <- confusionMatrix(pred.tree.pruned, df.test.aux$Severity)
+confmatrix.tree.pruned$overall["Accuracy"] # Accuracy is not improved after pruning
+
+# Random Forest
+# We will use tuneRF function, which searchs for the optimal value of mtry
+rf.mtry <- tuneRF(df.train.aux[,-1],df.train.aux[,1], stepFactor=1)
+rf <- randomForest(Severity ~ ., data=df.train.aux, mtry=rf.mtry[[1]])
+
+pred.rf <- predict(rf, df.test.aux, type = "class")
+confmatrix.rf <- confusionMatrix(pred.rf, df.test.aux$Severity)
+confmatrix.rf$overall["Accuracy"] # Random Forest yields the best accuracy (73%)
+
+write.csv(df.aux,"df.aux.32.csv", row.names=F)
+write.csv(df.train.aux, "df.train.aux.32.csv", row.names=F)
+write.csv(df.test.aux, "df.test.aux.32.csv", row.names=F)
+```
+
+### 3.2.bis - PCA Analysis
+```{r}
+df<-read.csv("df.31.csv", sep=",")
+df.train<-read.csv("df.train.31.csv", sep=",")
+df.test<-read.csv("df.test.31.csv", sep=",")
+
+# PCA
+pca.subset <- select_if(df.train, is.numeric) # PCA is only applied to numeric variables
+pca.subset$Severity <- NULL # The response variable is removed from this sub-dataset
+apply(pca.subset, 2, mean) 
+apply(pca.subset, 2, var)
+pca <- prcomp(pca.subset, center=TRUE, scale=TRUE) # In the previous lines, we have noticed that the mean and the variances of the features is really different, so it is necessary to scale them (this is achieved setting scale=T)
+summary(pca)
+pca$rotation
+
+# % Of variance explained -> An eigenvalue (or % of variance explained) less than 1 indicates that the component explains less than a single explanatory variable. These are subject to be discarded
+pve <- pca$sdev^2 / sum(pca$sdev^2)
+
+plot(pve, main = "Screen plot of the % of variance explained", xlab = "PC", ylab = "Proportion of Variance Explained", ylim = c(0, 0.5), type = "b",col="darkred")
+abline(v=3, col = "grey", lty=2)
+
+plot(cumsum(pve), xlab = "PC", ylab = "Cumulative Proportion of Variance Explained", ylim = c(0, 1), type = "b")
+```
+
+### 3.3 MODEL SELECTION
+```{r}
+# Doesn't make any sense to perform CV in Random Forest. In this method, we build a number of decision trees on bootstrapped training samples. But when building these decision trees, each time a split in a tree is considered, a random sample of mtry predictors is chosen as split candidates from the full set of predictors. The split is allowed to use only one of those m predictors.
+```
+
+
+### 3.4 MODEL EVALUATION
+```{r}
+df.aux<-read.csv("df.aux.32.csv", sep=",")
+df.train.aux <- read.csv("df.train.aux.32.csv", sep=",")
+df.test.aux <- read.csv("df.test.aux.32.csv", sep=",")
+
+df.aux$Severity <- factor(df.aux$Severity)
+df.train.aux$Severity <- factor(df.train.aux$Severity)
+df.test.aux$Severity <- factor(df.test.aux$Severity)
+
+aucs = c()
+plot(x=NA, y=NA, xlim=c(0,1), ylim=c(0,1),
+     ylab='True Positive Rate',
+     xlab='False Positive Rate',
+     bty='n')
+
+lvls = levels(df.train.aux$Severity)
+
+for (type.id in 1:4) {
+  type = as.factor(df.train.aux$Severity == lvls[type.id])
+
+  rf.mtry <- tuneRF(df.train.aux[,-1],df.train.aux[,1], stepFactor=1, plot=FALSE, trace=FALSE)
+  rf <- randomForest(type ~ ., data=df.train.aux[, -1], mtry=rf.mtry[[1]])
+  predi <- predict(rf, df.test.aux[, -1], type = "class")
+
+  pred = prediction(as.numeric(predi==TRUE), as.numeric(df.test.aux$Severity == lvls[type.id]) )
+  
+  nbperf = performance(pred, "tpr", "fpr")
+  
+  roc.x = unlist(nbperf@x.values)
+  roc.y = unlist(nbperf@y.values)
+  lines(roc.y ~ roc.x, col=type.id+1, lwd=2)
+
+  nbauc = performance(pred, "auc")
+  nbauc = unlist(slot(nbauc, "y.values"))
+  aucs[type.id] = nbauc
+}
+
+lines(x=c(0,1), c(0,1), lty=2)
+legend("topleft",inset=0.02, title=TeX("Severity $n$ prediction vs the others"), legend=c(TeX("$n = 1$"), TeX("$n = 2$"), TeX("$n = 3$"), TeX("$n = 4$"), "Random"), col=c(2,3,4,5,1), lwd=2,lty=c(1,1,1,1,2))
+
+mean(aucs)
+
+rf.mtry <- tuneRF(df.train.aux[,-1],df.train.aux[,1], stepFactor=1, plot=FALSE, trace=FALSE)
+rf <- randomForest(Severity ~ ., data=df.train.aux, mtry=rf.mtry[[1]])
+pred.rf <- predict(rf, df.test.aux, type = "class")
+
+confmatrix.rf <- confusionMatrix(pred.rf, df.test.aux$Severity)
+confmatrix.rf$overall["Accuracy"] # Random Forest yields the best accuracy (72%)
+
+print(confmatrix.rf)
+
+write.csv(df,"df.34.csv", row.names=F)
+```
